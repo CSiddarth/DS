@@ -1,8 +1,18 @@
 import feedparser
 from datetime import datetime
 from models import Article, Session
+import csv
+from celery import Celery
+from celery.schedules import crontab
+
+# Define the Celery app
+app = Celery('tasks', broker='pyamqp://guest@localhost//')
 
 def fetch_and_store_articles():
+    """
+    Fetches articles from specified RSS feeds, stores new entries in the database,
+    and exports newly fetched articles to a CSV file.
+    """
     session = Session()
     feeds = [
         "http://rss.cnn.com/rss/cnn_topstories.rss",
@@ -11,8 +21,9 @@ def fetch_and_store_articles():
         "http://feeds.reuters.com/reuters/businessNews",
         "http://feeds.feedburner.com/NewshourWorld",
         "https://feeds.bbci.co.uk/news/world/asia/india/rss.xml"
-        # Add more feeds as needed
     ]
+
+    articles_to_export = []
 
     for feed_url in feeds:
         feed = feedparser.parse(feed_url)
@@ -20,17 +31,12 @@ def fetch_and_store_articles():
             title = entry.title if 'title' in entry else 'No Title'
             link = entry.link if 'link' in entry else 'No Link'
             content = entry.summary if 'summary' in entry else 'No summary available'
-            print(f"Title: {title}, Link: {link}, Content: {content[:100]}")
-            # Handle pubDate with checking if it's present and correctly formatted
+
             if 'published_parsed' in entry:
                 pub_date = datetime(*entry.published_parsed[:6])
             else:
-                pub_date = datetime.now()  # Use current time if publication date is not available
-            
-            # Some feeds use 'summary', others 'description', or even 'content'
-            content = entry.summary if 'summary' in entry else (entry.description if 'description' in entry else 'No Content Available')
+                pub_date = datetime.now()
 
-            # Check if article already exists to prevent duplicates
             if not session.query(Article).filter_by(url=link).first():
                 article = Article(
                     title=title,
@@ -39,29 +45,40 @@ def fetch_and_store_articles():
                     url=link
                 )
                 session.add(article)
+                articles_to_export.append([title, content, pub_date.strftime("%Y-%m-%d %H:%M:%S"), link])
 
-                
-    
     session.commit()
     session.close()
+
+    # Export to CSV after storing in database
+    if articles_to_export:
+        export_to_csv(articles_to_export)
     print("Articles fetched and stored successfully.")
 
-fetch_and_store_articles()
+def export_to_csv(articles):
+    """
+    Exports a list of articles to a CSV file.
+    """
+    filename = 'exported_articles.csv'
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Title', 'Content', 'Publication Date', 'URL'])
+        writer.writerows(articles)
+    print(f"Data exported to {filename} successfully.")
 
-from celery import Celery
-from celery.schedules import crontab
+# Celery task
+@app.task
+def scheduled_fetch_and_store_articles():
+    print("Scheduled task: Fetching and storing articles...")
+    fetch_and_store_articles()
 
-app = Celery('tasks', broker='pyamqp://guest@localhost//')
-
-# Schedule
+# Celery beat schedule
 app.conf.beat_schedule = {
     'fetch-and-store-articles-every-1-minute': {
-        'task': 'app.fetch_and_store_articles',
-        'schedule': crontab(minute='*/1'),  # Executes every 30 minutes
+        'task': 'app.scheduled_fetch_and_store_articles',
+        'schedule': crontab(minute='*/1'),  # Adjust as necessary
     }
 }
 
-@app.task
-def fetch_and_store_articles():
-    # Your fetching and storing logic here
-    print("Fetching and storing articles...")
+if __name__ == '__main__':
+    fetch_and_store_articles()
